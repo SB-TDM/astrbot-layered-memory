@@ -56,8 +56,8 @@
   "cross_session_recent": {
     "description": "注入其他会话的即时摘要",
     "type": "bool",
-    "default": true,
-    "hint": "在私聊里也能知道群里刚才在聊什么（只带一句摘要，不带细节）。"
+    "default": false,
+    "hint": "关掉时各会话完全隔离；打开后私聊能看到群里刚才的摘要（单向）。"
   },
   "cross_fresh_minutes": {
     "description": "跨会话摘要的有效期（分钟）",
