@@ -28,6 +28,7 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
 DB_FILE = Path(__file__).resolve().parent / "memories.db"
+CONFIG_FILE = Path(__file__).resolve().parents[2] / "config" / "layered_memory_config.json"
 
 OWNER_UIN = "YOUR_QQ_NUMBER"
 RAW_KEEP_DAYS = 3
@@ -428,6 +429,46 @@ class LayeredMemory(Star):
         logger.info(f"[layered_memory] 月纪要 {session} {month}")
         return summary
 
+    def _reload_times(self) -> None:
+        """从配置文件重读三个纪要时间，改了不用重启。
+
+        文件读不到或格式不对就保持当前值。
+        """
+        try:
+            if not CONFIG_FILE.exists():
+                return
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+        except Exception:  # noqa: BLE001
+            return
+        self.daily_at = self._parse_time(data.get("daily_time", ""), self.daily_at)
+        self.weekly_at = self._parse_time(data.get("weekly_time", ""), self.weekly_at)
+        self.monthly_at = self._parse_time(data.get("monthly_time", ""), self.monthly_at)
+
+    def _save_time(self, key: str, value: str) -> bool:
+        """把关卡时间写回配置文件。
+
+        Args:
+            key: daily_time / weekly_time / monthly_time。
+            value: HH:MM。
+
+        Returns:
+            写入成功返回 True。
+        """
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8-sig"))
+        except Exception:  # noqa: BLE001
+            data = {}
+        data[key] = value
+        try:
+            CONFIG_FILE.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            self._reload_times()
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[layered_memory] 写配置失败: {e}")
+            return False
+
     def _should_refresh_recent(self, session: str) -> bool:
         """判断 L5 是否需要刷新。
 
@@ -558,6 +599,7 @@ class LayeredMemory(Star):
     async def _tick(self) -> None:
         if not self.enable:
             return
+        self._reload_times()
         # hybrid 模式：消息停止后也要能到点刷新，所以顺带扫一遍
         if str(self.recent_trigger).lower() == "hybrid":
             try:
@@ -673,6 +715,54 @@ class LayeredMemory(Star):
         con.commit()
         con.close()
         yield event.plain_result("记下了")
+
+    @filter.command("纪要时间")
+    async def show_time(self, event: AstrMessageEvent):
+        """查看或修改纪要生成时间：/纪要时间 或 /纪要时间 日 23:30"""
+        arg = (event.message_str or "").strip()
+        parts = arg.split()
+        if parts and parts[0].lstrip("/") in ("纪要时间",):
+            parts = parts[1:]
+
+        if not parts:
+            yield event.plain_result(
+                "现在的时间：\n"
+                f"日纪要 {self.daily_at[0]:02d}:{self.daily_at[1]:02d}\n"
+                f"周纪要 {self.weekly_at[0]:02d}:{self.weekly_at[1]:02d}（周日）\n"
+                f"月纪要 {self.monthly_at[0]:02d}:{self.monthly_at[1]:02d}（每月 1 号）\n"
+                "改法：/纪要时间 日 23:30"
+            )
+            return
+
+        if str(event.get_sender_id() or "") != OWNER_UIN:
+            yield event.plain_result("只有号主能改")
+            return
+
+        if len(parts) < 2:
+            yield event.plain_result("用法：/纪要时间 日 23:30（日/周/月）")
+            return
+
+        which, value = parts[0], parts[1]
+        key_map = {"日": "daily_time", "周": "weekly_time", "月": "monthly_time"}
+        if which not in key_map:
+            yield event.plain_result("第一个字要写 日 / 周 / 月")
+            return
+
+        hh, _, mm = value.partition(":")
+        try:
+            h, m = int(hh), int(mm)
+            if not (0 <= h < 24 and 0 <= m < 60):
+                raise ValueError
+        except ValueError:
+            yield event.plain_result("时间格式要写成 23:30 这样")
+            return
+
+        ok = self._save_time(key_map[which], f"{h:02d}:{m:02d}")
+        if ok:
+            label = {"日": "日纪要", "周": "周纪要", "月": "月纪要"}[which]
+            yield event.plain_result(f"{label}改到 {h:02d}:{m:02d} 了，不用重启")
+        else:
+            yield event.plain_result("写配置失败，看下日志")
 
     @filter.command("总结")
     async def summarize_now(self, event: AstrMessageEvent):
