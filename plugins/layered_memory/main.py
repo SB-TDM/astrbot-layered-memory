@@ -315,6 +315,13 @@ class LayeredMemory(Star):
     async def _summarize_session(self, session: str, day: str | None = None) -> str:
         """L6 -> L4：把一个会话当天的原文压成日纪要。"""
         day = day or today_str()
+        con = self._conn()
+        exists = con.execute(
+            "SELECT 1 FROM daily WHERE session=? AND day=?", (session, day)
+        ).fetchone()
+        con.close()
+        if exists:
+            return
         try:
             day_start = datetime.strptime(day, "%Y-%m-%d").timestamp()
         except ValueError:
@@ -357,6 +364,14 @@ class LayeredMemory(Star):
         con.close()
         if not rows:
             return ""
+        wk_check = week_key(end)
+        con = self._conn()
+        exists = con.execute(
+            "SELECT 1 FROM weekly WHERE session=? AND week=?", (session, wk_check)
+        ).fetchone()
+        con.close()
+        if exists:
+            return ""
         chat = "\n".join(f"{d}：{t}" for d, t in rows)
         summary = await self._call_llm(
             WEEKLY_PROMPT.format(
@@ -391,6 +406,13 @@ class LayeredMemory(Star):
             ).fetchall()
         con.close()
         if not rows:
+            return ""
+        con = self._conn()
+        exists = con.execute(
+            "SELECT 1 FROM monthly WHERE session=? AND month=?", (session, month)
+        ).fetchone()
+        con.close()
+        if exists:
             return ""
         chat = "\n".join(f"{k}：{v}" for k, v in rows)
         summary = await self._call_llm(MONTHLY_PROMPT.format(month=month, chat=chat))
@@ -503,7 +525,8 @@ class LayeredMemory(Star):
                 )
             }
             con.close()
-            missing = sorted(raw_days - saved)
+            today = today_str()
+            missing = sorted(d for d in raw_days - saved if d < today)
             if not missing:
                 return
             logger.info(f"[layered_memory] 补生成纪要：{missing}")
@@ -549,22 +572,30 @@ class LayeredMemory(Star):
         now = datetime.now()
         stamp = now.strftime("%Y-%m-%d %H:%M")
 
-        if (now.hour, now.minute) == self.daily_at and self._done.get("daily") != today_str():
+        # 不用「正好等于某一分钟」判断：单次 sleep 加上一轮工作总结可能跨过整分钟，
+        # 一旦错过就整天不补。改成「到点且今天没做过」——晚到多久都会补上。
+        daily_due = now.replace(hour=self.daily_at[0], minute=self.daily_at[1],
+                                second=0, microsecond=0)
+        if now >= daily_due and self._done.get("daily") != today_str():
             self._done["daily"] = today_str()
             for s in self._sessions(86400):
                 await self._summarize_session(s)
 
-        if (
-            (now.hour, now.minute) == self.weekly_at
-            and now.isoweekday() == 7
-            and self._done.get("weekly") != week_key()
-        ):
-            self._done["weekly"] = week_key()
+        # 周纪要：最近一个「周日 + 设定时刻」。没做完就补，跨重启也能补。
+        days_back = (now.isoweekday() - 7) % 7
+        weekly_due = (now - timedelta(days=days_back)).replace(
+            hour=self.weekly_at[0], minute=self.weekly_at[1], second=0, microsecond=0
+        )
+        if now >= weekly_due and self._done.get("weekly") != week_key(weekly_due):
+            self._done["weekly"] = week_key(weekly_due)
             for s in self._sessions(8 * 86400):
                 await self._build_weekly(s)
 
-        if (now.hour, now.minute) == self.monthly_at and now.day == 1:
-            prev = (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+        # 月纪要：本月 1 号的设定时刻，到点就算，不限于当天。
+        monthly_due = now.replace(day=1, hour=self.monthly_at[0],
+                                 minute=self.monthly_at[1], second=0, microsecond=0)
+        if now >= monthly_due:
+            prev = (monthly_due - timedelta(days=1)).strftime("%Y-%m")
             if self._done.get("monthly") != prev:
                 self._done["monthly"] = prev
                 for s in self._sessions(40 * 86400):

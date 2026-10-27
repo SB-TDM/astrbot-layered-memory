@@ -32,7 +32,7 @@
   "daily_time": {
     "description": "日纪要生成时间",
     "type": "string",
-    "default": "23:50",
+    "default": "23:58",
     "hint": "格式 HH:MM，24 小时制。"
   },
   "weekly_time": {
