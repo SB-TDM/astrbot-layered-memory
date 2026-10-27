@@ -1,4 +1,6 @@
-# AstrBot 记忆插件：分层记忆 + 群友档案
+# astrbot-layered-memory
+
+AstrBot 的记忆插件集：**七层分层记忆 + 群友档案**。
 
 给 AstrBot 补两块内置做不好的能力：
 
