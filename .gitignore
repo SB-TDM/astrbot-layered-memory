@@ -1,0 +1,31 @@
+# 目录布局
+# AstrBot / SnowLuma 本体与运行数据不入库，只放我们自己的插件和脚本
+
+# 运行数据
+data/
+*.db
+*.db-wal
+*.db-shm
+*.log
+logs/
+profiles.json
+state.json
+memories.db
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 密钥（永远不要提交）
+.env
+*.key
+secrets.json
