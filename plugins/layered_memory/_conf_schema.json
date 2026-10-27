@@ -8,7 +8,7 @@
   "raw_keep_days": {
     "description": "原文保留天数",
     "type": "int",
-    "default": 3,
+    "default": 7,
     "hint": "L6 原始对话保留多久。超过就删，删了无法再补生成纪要。"
   },
   "daily_inject": {
@@ -96,5 +96,17 @@
     "type": "int",
     "default": 5,
     "hint": "新增消息少于这个数就不刷新，避免为一两句话调用模型。"
+  },
+  "recall_enabled": {
+    "description": "旧纪要按需召回",
+    "type": "bool",
+    "default": true,
+    "hint": "每轮只看最近一份月/周纪要，提到旧话题时按关键词从历史纪要里翻出相关的一条。"
+  },
+  "recall_max": {
+    "description": "最多召回几条",
+    "type": "int",
+    "default": 2,
+    "hint": "召回太多会挤占上下文，2 条一般够用。"
   }
 }

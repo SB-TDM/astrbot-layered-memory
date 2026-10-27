@@ -34,16 +34,26 @@ COMPACT_TARGET = 10            # 压缩后保留的条数
 COMPACT_AT = (4, 30)           # 每周一 04:30 全量压缩一次
 # Same sender will not trigger another extraction within this window (seconds).
 MIN_INTERVAL = 300           # 同一个号两次抽取的最小间隔（秒）
+COMMIT_FILE = Path(__file__).resolve().parent / "commitments.json"
+COMMIT_KEEP_DAYS = 30          # 承诺/约定的保留天数
+COMMIT_MAX = 12                # 每人最多几条承诺
+CORE_DB = DATA_DIR / "plugins" / "layered_memory" / "memories.db"
 
 EXTRACT_SYSTEM = (
     "你是一个信息抽取器。只输出 JSON，不要解释。"
-    '输出格式：{"facts": ["...", "..."]}，没有可记的就输出 {"facts": []}。'
+    '输出格式：{"facts": ["...", "..."], "commitments": ["..."]}，'
+    '没有就输出 {"facts": [], "commitments": []}。'
 )
 
 EXTRACT_TEMPLATE = """下面是「用户」和「助手」的一轮对话，请判断其中有没有关于这个用户的**长期稳定**信息。
 
 可以记：职业、身份（如号主、学生、后端）、长期爱好、常用工具或技术栈、明确表达过的偏好和雷点、长期在做的事。
 不要记：称呼和叫法（"爸""哥"这类随时会改，由人设定，记了会跟人设打架）、一次性的情绪、当天吃了什么、临时的安排、礼貌性寒暄、助手自己说过的话。
+
+另外单独抽一类：**承诺和约定**。指有明确指向、过后还要兑现的事，比如"下周三去北京出差""周五前把方案给他""答应周末陪他打游戏"。只写一句，带上时间或事件；没有就留空。
+
+如果本轮信息和下面的长期设定冲突，以设定为准，不要记：
+{core}
 
 已有档案：
 {existing}
@@ -52,7 +62,9 @@ EXTRACT_TEMPLATE = """下面是「用户」和「助手」的一轮对话，请�
 用户：{user_text}
 助手：{reply}
 
-请输出合并后的**完整**档案（已有 + 新增，去重，最多 {max_facts} 条），只输出 JSON。"""
+请输出两部分，只输出 JSON：
+- facts：合并后的**完整**档案（已有 + 新增，去重，最多 {max_facts} 条）
+- commitments：本轮新出现的承诺（没有就空数组）"""
 
 COMPACT_PROMPT = """下面是一个用户的长期档案，可能包含重复、过时或互相矛盾的条目。
 
@@ -172,6 +184,16 @@ class UserMemory(Star):
             blocks.append("\n".join(lines))
 
         # 好感度：群聊按群号查，私聊按对方 QQ 号查
+        # 承诺/约定：条数少、期限长，每轮都带上，避免"答应过的事"被忘掉
+        commits = self._load_commitments().get(uid) or []
+        if commits:
+            lines = [f"- {c.get('text', '')}" for c in commits if c.get("text")]
+            if lines:
+                blocks.append(
+                    "【还没兑现的事】\n" + "\n".join(lines)
+                    + "\n这些是之前约好的，合适的时候提一下，别装不知道。"
+                )
+
         gid = str(event.get_group_id() or uid)
         affection = self._read_affection(uid, gid) if self.inject_affection else None
         if affection is not None:
@@ -248,6 +270,7 @@ class UserMemory(Star):
             existing = prof.get(FACTS_KEY, [])
 
             prompt = EXTRACT_TEMPLATE.format(
+                core=self._read_core(uid) or "（暂无）",
                 existing=json.dumps(existing, ensure_ascii=False),
                 user_text=user_text[:800],
                 reply=reply[:800],
@@ -256,9 +279,12 @@ class UserMemory(Star):
             resp = await provider.text_chat(
                 prompt=prompt, system_prompt=EXTRACT_SYSTEM, persist=False
             )
-            new_facts = self._parse_facts(getattr(resp, "completion_text", ""))
-            if new_facts is None:
+            parsed = self._parse_facts(getattr(resp, "completion_text", ""))
+            if parsed is None:
                 return
+            new_facts, new_commits = parsed
+            if new_commits:
+                self._save_commitments(uid, new_commits)
 
             merged = self._dedupe_facts(list(existing) + list(new_facts))
             merged = merged[-self.max_facts:]
@@ -276,6 +302,67 @@ class UserMemory(Star):
                 asyncio.create_task(self._compact(uid))
         except Exception as e:  # noqa: BLE001
             logger.error(f"[user_memory] 抽取失败 uid={uid}: {e}")
+
+    # ---------- 承诺 ----------
+
+    def _load_commitments(self) -> dict:
+        """读承诺文件，顺手清掉过期的。"""
+        if not COMMIT_FILE.exists():
+            return {}
+        try:
+            data = json.loads(COMMIT_FILE.read_text(encoding="utf-8"))
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[user_memory] 读承诺失败: {e}")
+            return {}
+        cutoff = time.time() - COMMIT_KEEP_DAYS * 86400
+        cleaned = {}
+        for uid, items in data.items():
+            alive = [
+                it for it in items
+                if isinstance(it, dict) and it.get("ts", 0) >= cutoff
+            ]
+            if alive:
+                cleaned[uid] = alive[-COMMIT_MAX:]
+        return cleaned
+
+    def _save_commitments(self, uid: str, texts: list[str]) -> None:
+        """追加承诺并落盘。
+
+        Args:
+            uid: QQ 号。
+            texts: 新的承诺文本列表。
+        """
+        data = self._load_commitments()
+        items = data.get(uid, [])
+        known = {it.get("text") for it in items}
+        for text in texts:
+            text = str(text).strip()
+            if not text or text in known:
+                continue
+            items.append({"text": text[:120], "ts": time.time()})
+            known.add(text)
+        data[uid] = items[-COMMIT_MAX:]
+        try:
+            COMMIT_FILE.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[user_memory] 写承诺失败: {e}")
+
+    @staticmethod
+    def _read_core(uid: str) -> str:
+        """从分层记忆库里读这个人的 L1 内核，供抽取时比对。"""
+        if not CORE_DB.exists():
+            return ""
+        try:
+            con = sqlite3.connect(f"file:{CORE_DB}?mode=ro", uri=True)
+            row = con.execute(
+                "SELECT content FROM core WHERE key=?", (uid,)
+            ).fetchone()
+            con.close()
+            return (row[0] or "") if row else ""
+        except Exception:  # noqa: BLE001
+            return ""
 
     # ---------- 去重 ----------
 
@@ -349,7 +436,10 @@ class UserMemory(Star):
         facts = payload.get(FACTS_KEY)
         if not isinstance(facts, list):
             return None
-        return [str(f) for f in facts]
+        commits = payload.get("commitments")
+        if not isinstance(commits, list):
+            commits = []
+        return [str(f) for f in facts], [str(c) for c in commits if str(c).strip()]
 
     # ---------- 压缩 ----------
 
@@ -382,10 +472,10 @@ class UserMemory(Star):
             resp = await provider.text_chat(
                 prompt=prompt, system_prompt=EXTRACT_SYSTEM, persist=False
             )
-            compacted = self._parse_facts(getattr(resp, "completion_text", ""))
-            if not compacted:
+            parsed = self._parse_facts(getattr(resp, "completion_text", ""))
+            if not parsed:
                 return 0
-            compacted = self._dedupe_facts(compacted)[-self.max_facts:]
+            compacted = self._dedupe_facts(parsed[0])[-self.max_facts:]
 
             async with self._io_lock:
                 data = self._load()

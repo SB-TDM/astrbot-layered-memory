@@ -17,6 +17,7 @@ Commands:
 """
 
 import asyncio
+import re
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -124,6 +125,8 @@ class LayeredMemory(Star):
         self.recent_trigger = self._cfg("recent_trigger", "turns", str)
         self.recent_interval = self._cfg("recent_interval_minutes", 5, int)
         self.recent_min_msgs = self._cfg("recent_min_messages", 5, int)
+        self.recall_enabled = self._cfg("recall_enabled", True, bool)
+        self.recall_max = self._cfg("recall_max", 2, int)
         self._init_db()
         self._task: asyncio.Task | None = None
         self._done: dict[str, str] = {}      # 防止同一时间点重复触发
@@ -237,6 +240,13 @@ class LayeredMemory(Star):
                 )
             if recent and recent[0]:
                 blocks.append("【刚才在聊】\n" + recent[0][:200])
+
+            # 旧纪要召回：本月之外的月/周纪要默认不注入，但用户提到相关词时翻出来
+            if self.recall_enabled:
+                recalled = self._recall(session, event.get_message_str() or "",
+                                        month[0] if month else "", week[0] if week else "")
+                if recalled:
+                    blocks.append(recalled)
 
             # 跨会话：把另一个会话的即时摘要也带上，避免换个场景就接不上话
             # 默认只在私聊里带别的会话摘要；群里不带，避免私聊内容外泄
@@ -428,6 +438,72 @@ class LayeredMemory(Star):
         con.close()
         logger.info(f"[layered_memory] 月纪要 {session} {month}")
         return summary
+
+    @staticmethod
+    def _keywords(text: str) -> set[str]:
+        """从一句话里粗提关键词。
+
+        中文没有空格，用二字切片代替分词；英文和数字按长度过滤。
+
+        Args:
+            text: 原始文本。
+
+        Returns:
+            关键词集合。
+        """
+        text = re.sub(r"[^\w\u4e00-\u9fa5]+", " ", str(text or "")).lower()
+        words: set[str] = set()
+        for token in text.split():
+            if re.fullmatch(r"[0-9a-z]+", token):
+                if len(token) >= 3:
+                    words.add(token)
+                continue
+            if len(token) < 2:
+                continue
+            words.update(token[i:i + 2] for i in range(len(token) - 1))
+        return words
+
+    def _recall(self, session: str, text: str, cur_month: str, cur_week: str) -> str:
+        """按关键词从更早的月/周纪要里找回一条最相关的。
+
+        Args:
+            session: 会话标识。
+            text: 用户这一轮说的话。
+            cur_month: 已经注入的月纪要键，避免重复。
+            cur_week: 已经注入的周纪要键，避免重复。
+
+        Returns:
+            拼好的提示块；没有相关记录时返回空串。
+        """
+        words = self._keywords(text)
+        if len(words) < 2:
+            return ""
+        try:
+            con = self._conn()
+            rows = con.execute(
+                "SELECT month, content, 'month' FROM monthly WHERE session=? AND month != ? "
+                "UNION ALL "
+                "SELECT week, content, 'week' FROM weekly WHERE session=? AND week != ?",
+                (session, cur_month, session, cur_week),
+            ).fetchall()
+            con.close()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[layered_memory] 召回失败: {e}")
+            return ""
+
+        scored = []
+        for key, content, kind in rows:
+            if not content:
+                continue
+            hits = len(words & self._keywords(content))
+            if hits >= 2:
+                scored.append((hits, key, kind, content))
+        if not scored:
+            return ""
+        scored.sort(key=lambda x: x[0], reverse=True)
+        picked = scored[:max(1, self.recall_max)]
+        lines = [f"{key}：{content[:220]}" for _, key, _, content in picked]
+        return "【以前聊过的相关记录】\n" + "\n".join(lines)
 
     def _reload_times(self) -> None:
         """从配置文件重读三个纪要时间，改了不用重启。
