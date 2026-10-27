@@ -1,0 +1,74 @@
+{
+  "enable": {
+    "description": "启用插件",
+    "type": "bool",
+    "default": true,
+    "hint": "总开关。关闭后不注入档案、不抽取、不压缩。"
+  },
+  "inject_profile": {
+    "description": "注入档案",
+    "type": "bool",
+    "default": true,
+    "hint": "每轮把该用户的档案拼进 system prompt。"
+  },
+  "inject_affection": {
+    "description": "注入好感度",
+    "type": "bool",
+    "default": true,
+    "hint": "每轮把好感度数值拼进 system prompt，由人设决定怎么用。"
+  },
+  "extract_enabled": {
+    "description": "自动抽取事实",
+    "type": "bool",
+    "default": true,
+    "hint": "回复后调用模型，从对话里提炼稳定事实写进档案。关闭后档案只能手动维护。"
+  },
+  "min_interval_seconds": {
+    "description": "抽取最小间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "同一个 QQ 号两次抽取之间的最短时间。调大更省调用，调小记得更细。"
+  },
+  "min_message_length": {
+    "description": "触发抽取的最短消息长度",
+    "type": "int",
+    "default": 4,
+    "hint": "用户消息短于这个字数就不抽取，避免「在吗」这种被当成素材。"
+  },
+  "max_facts": {
+    "description": "每人最多事实条数",
+    "type": "int",
+    "default": 30,
+    "hint": "超过会被压缩；压缩后的目标条数见下一项。"
+  },
+  "similarity_threshold": {
+    "description": "去重相似度阈值",
+    "type": "float",
+    "default": 0.85,
+    "hint": "0-1 之间。越高越严格，0.85 能合并「同一件事的不同说法」。"
+  },
+  "compact_enabled": {
+    "description": "启用压缩",
+    "type": "bool",
+    "default": true,
+    "hint": "超过阈值时调用模型把档案合并精简。关闭后档案只增不减（到上限丢最旧的）。"
+  },
+  "compact_threshold": {
+    "description": "压缩触发阈值",
+    "type": "int",
+    "default": 15,
+    "hint": "事实条数超过这个值就触发压缩。"
+  },
+  "compact_target": {
+    "description": "压缩后保留条数",
+    "type": "int",
+    "default": 10,
+    "hint": "压缩时要求模型收敛到这个条数以内。"
+  },
+  "weekly_compact": {
+    "description": "每周全量压缩",
+    "type": "bool",
+    "default": true,
+    "hint": "每周一 04:30 把所有档案压缩一遍，清理过时信息。"
+  }
+}
