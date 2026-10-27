@@ -1,0 +1,4 @@
+name: user_memory
+desc: 给每个群友维护一份长期档案：自动抽取稳定信息，下次对话时注入提示词
+author: local
+version: 1.0.0
