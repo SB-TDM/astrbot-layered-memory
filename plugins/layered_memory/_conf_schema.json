@@ -1,0 +1,56 @@
+{
+  "enable": {
+    "description": "启用分层记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "总开关。关闭后不注入、不记录、不压缩。"
+  },
+  "raw_keep_days": {
+    "description": "原文保留天数",
+    "type": "int",
+    "default": 3,
+    "hint": "L6 原始对话保留多久。超过就删，删了无法再补生成纪要。"
+  },
+  "daily_inject": {
+    "description": "注入最近几日的纪要",
+    "type": "int",
+    "default": 2,
+    "hint": "每轮注入最近 N 条日纪要。"
+  },
+  "recent_turns": {
+    "description": "即时摘要刷新间隔（轮）",
+    "type": "int",
+    "default": 20,
+    "hint": "L5 每隔多少轮把最近的原文压成一两句即时摘要。"
+  },
+  "core_max_chars": {
+    "description": "内核最大字数",
+    "type": "int",
+    "default": 500,
+    "hint": "L1 内核最多保留多少字，超出后保留最新的部分。"
+  },
+  "daily_time": {
+    "description": "日纪要生成时间",
+    "type": "string",
+    "default": "23:50",
+    "hint": "格式 HH:MM，24 小时制。"
+  },
+  "weekly_time": {
+    "description": "周纪要生成时间",
+    "type": "string",
+    "default": "23:55",
+    "hint": "格式 HH:MM，只在每周日触发。"
+  },
+  "monthly_time": {
+    "description": "月纪要生成时间",
+    "type": "string",
+    "default": "00:05",
+    "hint": "格式 HH:MM，只在每月 1 号触发。"
+  },
+  "backfill_enabled": {
+    "description": "启动时补生成缺失纪要",
+    "type": "bool",
+    "default": true,
+    "hint": "开机时检查前几天有没有漏掉的日纪要，有就用还在的原文补生成。原文已被删的则无法补。"
+  }
+}

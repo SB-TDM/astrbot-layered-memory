@@ -1,0 +1,4 @@
+name: layered_memory
+desc: 分层记忆（最小版）：L1 内核 + L4 日纪要 + L6 原文缓存，原文 3 天清理
+author: local
+version: 0.1.0
