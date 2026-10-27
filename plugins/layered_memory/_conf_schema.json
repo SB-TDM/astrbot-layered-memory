@@ -64,5 +64,11 @@
     "type": "int",
     "default": 120,
     "hint": "只注入这个时间内的摘要，太旧的不带，避免翻旧账。"
+  },
+  "cross_in_group": {
+    "description": "群里也注入其他会话摘要",
+    "type": "bool",
+    "default": false,
+    "hint": "关掉时，私聊里能看到群里的摘要，但群里看不到私聊的摘要。打开会双向，注意隐私。"
   }
 }

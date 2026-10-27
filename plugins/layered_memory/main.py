@@ -119,6 +119,7 @@ class LayeredMemory(Star):
         self.backfill_enabled = self._cfg("backfill_enabled", True, bool)
         self.cross_session_recent = self._cfg("cross_session_recent", True, bool)
         self.cross_fresh_minutes = self._cfg("cross_fresh_minutes", 120, int)
+        self.cross_in_group = self._cfg("cross_in_group", False, bool)
         self._init_db()
         self._task: asyncio.Task | None = None
         self._done: dict[str, str] = {}      # 防止同一时间点重复触发
@@ -234,7 +235,11 @@ class LayeredMemory(Star):
                 blocks.append("【刚才在聊】\n" + recent[0][:200])
 
             # 跨会话：把另一个会话的即时摘要也带上，避免换个场景就接不上话
-            if self.cross_session_recent:
+            # 默认只在私聊里带别的会话摘要；群里不带，避免私聊内容外泄
+            inject_cross = self.cross_session_recent and (
+                self.cross_in_group or "GroupMessage" not in session
+            )
+            if inject_cross:
                 con = self._conn()
                 other = con.execute(
                     "SELECT content FROM recent WHERE session != ? AND updated_at > ? "
