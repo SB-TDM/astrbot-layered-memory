@@ -117,6 +117,8 @@ class LayeredMemory(Star):
         self.weekly_at = self._parse_time(self._cfg("weekly_time", "23:55", str), WEEKLY_AT)
         self.monthly_at = self._parse_time(self._cfg("monthly_time", "00:05", str), MONTHLY_AT)
         self.backfill_enabled = self._cfg("backfill_enabled", True, bool)
+        self.cross_session_recent = self._cfg("cross_session_recent", True, bool)
+        self.cross_fresh_minutes = self._cfg("cross_fresh_minutes", 120, int)
         self._init_db()
         self._task: asyncio.Task | None = None
         self._done: dict[str, str] = {}      # 防止同一时间点重复触发
@@ -230,6 +232,18 @@ class LayeredMemory(Star):
                 )
             if recent and recent[0]:
                 blocks.append("【刚才在聊】\n" + recent[0][:200])
+
+            # 跨会话：把另一个会话的即时摘要也带上，避免换个场景就接不上话
+            if self.cross_session_recent:
+                con = self._conn()
+                other = con.execute(
+                    "SELECT content FROM recent WHERE session != ? AND updated_at > ? "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (session, time.time() - self.cross_fresh_minutes * 60),
+                ).fetchone()
+                con.close()
+                if other and other[0]:
+                    blocks.append("【另一个会话里刚才在聊】\n" + other[0][:150])
 
             if blocks:
                 req.system_prompt = (

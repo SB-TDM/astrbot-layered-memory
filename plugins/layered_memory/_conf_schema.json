@@ -52,5 +52,17 @@
     "type": "bool",
     "default": true,
     "hint": "开机时检查前几天有没有漏掉的日纪要，有就用还在的原文补生成。原文已被删的则无法补。"
+  },
+  "cross_session_recent": {
+    "description": "注入其他会话的即时摘要",
+    "type": "bool",
+    "default": true,
+    "hint": "在私聊里也能知道群里刚才在聊什么（只带一句摘要，不带细节）。"
+  },
+  "cross_fresh_minutes": {
+    "description": "跨会话摘要的有效期（分钟）",
+    "type": "int",
+    "default": 120,
+    "hint": "只注入这个时间内的摘要，太旧的不带，避免翻旧账。"
   }
 }
