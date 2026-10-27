@@ -70,5 +70,31 @@
     "type": "bool",
     "default": false,
     "hint": "关掉时，私聊里能看到群里的摘要，但群里看不到私聊的摘要。打开会双向，注意隐私。"
+  },
+  "recent_trigger": {
+    "description": "L5 刷新方式",
+    "type": "string",
+    "options": [
+      "turns",
+      "hybrid"
+    ],
+    "labels": [
+      "按轮数",
+      "按时间 + 条数"
+    ],
+    "default": "turns",
+    "hint": "turns：攒够 recent_turns 条消息就刷新；hybrid：至少攒够 recent_min_messages 条，且距上次刷新超过 recent_interval_minutes 分钟。"
+  },
+  "recent_interval_minutes": {
+    "description": "hybrid 模式刷新间隔（分钟）",
+    "type": "int",
+    "default": 5,
+    "hint": "只在 hybrid 模式下生效。"
+  },
+  "recent_min_messages": {
+    "description": "hybrid 模式最少新增消息数",
+    "type": "int",
+    "default": 5,
+    "hint": "新增消息少于这个数就不刷新，避免为一两句话调用模型。"
   }
 }

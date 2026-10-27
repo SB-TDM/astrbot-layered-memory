@@ -120,6 +120,9 @@ class LayeredMemory(Star):
         self.cross_session_recent = self._cfg("cross_session_recent", True, bool)
         self.cross_fresh_minutes = self._cfg("cross_fresh_minutes", 120, int)
         self.cross_in_group = self._cfg("cross_in_group", False, bool)
+        self.recent_trigger = self._cfg("recent_trigger", "turns", str)
+        self.recent_interval = self._cfg("recent_interval_minutes", 5, int)
+        self.recent_min_msgs = self._cfg("recent_min_messages", 5, int)
         self._init_db()
         self._task: asyncio.Task | None = None
         self._done: dict[str, str] = {}      # 防止同一时间点重复触发
@@ -289,9 +292,7 @@ class LayeredMemory(Star):
             con.commit()
             con.close()
 
-            n = self._turn_count.get(session, 0) + 1
-            self._turn_count[session] = n
-            if n % self.recent_turns == 0:
+            if self._should_refresh_recent(session):
                 asyncio.create_task(self._refresh_recent(session))
         except Exception as e:  # noqa: BLE001
             logger.error(f"[layered_memory] 记录失败: {e}")
@@ -405,6 +406,41 @@ class LayeredMemory(Star):
         logger.info(f"[layered_memory] 月纪要 {session} {month}")
         return summary
 
+    def _should_refresh_recent(self, session: str) -> bool:
+        """判断 L5 是否需要刷新。
+
+        两种模式：
+            turns  — 距上次摘要又攒够 recent_turns 条用户消息
+            hybrid — 至少攒够 recent_min_messages 条，且距上次摘要超过
+                     recent_interval_minutes 分钟
+
+        Args:
+            session: 会话标识。
+
+        Returns:
+            需要刷新返回 True。
+        """
+        try:
+            con = self._conn()
+            last = con.execute(
+                "SELECT updated_at FROM recent WHERE session=?", (session,)
+            ).fetchone()
+            since = last[0] if last else 0
+            n = con.execute(
+                "SELECT COUNT(*) FROM raw WHERE session=? AND role='user' AND ts > ?",
+                (session, since),
+            ).fetchone()[0]
+            con.close()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[layered_memory] 判断 L5 失败: {e}")
+            return False
+
+        if str(self.recent_trigger).lower() == "hybrid":
+            if n < self.recent_min_msgs:
+                return False
+            return (time.time() - since) >= self.recent_interval * 60
+        return n >= self.recent_turns
+
     async def _refresh_recent(self, session: str) -> None:
         """L5：把最近 RECENT_TURNS 条原文压成一两句即时摘要。"""
         try:
@@ -499,6 +535,17 @@ class LayeredMemory(Star):
     async def _tick(self) -> None:
         if not self.enable:
             return
+        # hybrid 模式：消息停止后也要能到点刷新，所以顺带扫一遍
+        if str(self.recent_trigger).lower() == "hybrid":
+            try:
+                con = self._conn()
+                sessions = [r[0] for r in con.execute("SELECT DISTINCT session FROM raw")]
+                con.close()
+                for session in sessions:
+                    if self._should_refresh_recent(session):
+                        asyncio.create_task(self._refresh_recent(session))
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"[layered_memory] hybrid 检查失败: {e}")
         now = datetime.now()
         stamp = now.strftime("%Y-%m-%d %H:%M")
 
