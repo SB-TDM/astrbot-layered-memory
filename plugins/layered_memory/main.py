@@ -18,6 +18,8 @@ Commands:
 
 import asyncio
 import re
+import numpy as np
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -30,6 +32,9 @@ from astrbot.api.star import Context, Star
 
 DB_FILE = Path(__file__).resolve().parent / "memories.db"
 CONFIG_FILE = Path(__file__).resolve().parents[2] / "config" / "layered_memory_config.json"
+EMBED_DIR = Path(__file__).resolve().parents[2] / "plugin_data" / "embeddings"
+EMBED_MODEL = "BAAI/bge-small-zh-v1.5"
+EMBED_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 
 OWNER_UIN = "YOUR_QQ_NUMBER"
 RAW_KEEP_DAYS = 3
@@ -127,6 +132,10 @@ class LayeredMemory(Star):
         self.recent_min_msgs = self._cfg("recent_min_messages", 5, int)
         self.recall_enabled = self._cfg("recall_enabled", True, bool)
         self.recall_max = self._cfg("recall_max", 2, int)
+        self.recall_mode = self._cfg("recall_mode", "hybrid", str)
+        self.recall_threshold = self._cfg("recall_threshold", 0.45, float)
+        self.recall_margin = self._cfg("recall_margin", 0.05, float)
+        self._embedder = None
         self._init_db()
         self._task: asyncio.Task | None = None
         self._done: dict[str, str] = {}      # 防止同一时间点重复触发
@@ -243,8 +252,19 @@ class LayeredMemory(Star):
 
             # 旧纪要召回：本月之外的月/周纪要默认不注入，但用户提到相关词时翻出来
             if self.recall_enabled:
-                recalled = self._recall(session, event.get_message_str() or "",
-                                        month[0] if month else "", week[0] if week else "")
+                mode = str(self.recall_mode).lower()
+                text = event.get_message_str() or ""
+                cur_m = month[0] if month else ""
+                cur_w = week[0] if week else ""
+                recalled = ""
+                if mode in ("vector", "hybrid"):
+                    key, content = await asyncio.to_thread(
+                        self._recall_vector, session, text, cur_m, cur_w
+                    )
+                    if content:
+                        recalled = f"【以前聊过的相关记录】\n{key}：{content[:220]}"
+                if not recalled and mode in ("keyword", "hybrid"):
+                    recalled = self._recall(session, text, cur_m, cur_w)
                 if recalled:
                     blocks.append(recalled)
 
@@ -285,6 +305,8 @@ class LayeredMemory(Star):
                 return
             user_text = (event.get_message_str() or "").strip()
             reply = (getattr(resp, "completion_text", "") or "").strip()
+            logger.info(f"[layered_memory] 收到一轮 session={session} uid={uid} "
+                        f"user={len(user_text)}字 reply={len(reply)}字")
             if not user_text:
                 return
 
@@ -462,6 +484,101 @@ class LayeredMemory(Star):
                 continue
             words.update(token[i:i + 2] for i in range(len(token) - 1))
         return words
+
+    def _get_embedder(self):
+        """懒加载本地向量模型（首次会下载到项目盘）。
+
+        Returns:
+            fastembed 的 TextEmbedding 实例；不可用时返回 None。
+        """
+        if self._embedder is not None:
+            return self._embedder or None
+        try:
+            # 走镜像下载，并关掉 xet 传输（镜像不代理它）
+            os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+            os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+            os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+            from fastembed import TextEmbedding
+
+            EMBED_DIR.mkdir(parents=True, exist_ok=True)
+            self._embedder = TextEmbedding(
+                model_name=EMBED_MODEL, cache_dir=str(EMBED_DIR / "models")
+            )
+            logger.info("[layered_memory] 向量模型已加载")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[layered_memory] 向量模型不可用，回退关键词: {e}")
+            self._embedder = False
+        return self._embedder or None
+
+    def _embed(self, texts: list[str]) -> list[list[float]]:
+        """把一批文本向量化。
+
+        Args:
+            texts: 待向量化的文本。
+
+        Returns:
+            与输入等长的向量列表；模型不可用时返回空列表。
+        """
+        model = self._get_embedder()
+        if not model or not texts:
+            return []
+        try:
+            return [list(map(float, v)) for v in model.embed(texts)]
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[layered_memory] 向量化失败: {e}")
+            return []
+
+    def _recall_vector(self, session: str, text: str,
+                       cur_month: str, cur_week: str) -> tuple[str, str]:
+        """用向量相似度找回一条最相关的旧纪要。
+
+        Args:
+            session: 会话标识。
+            text: 用户这一轮说的话。
+            cur_month: 已注入的月纪要键。
+            cur_week: 已注入的周纪要键。
+
+        Returns:
+            (key, content) 二元组；没有足够相关的返回 ("", "")。
+        """
+        text = (text or "").strip()
+        if len(text) < 4:
+            return "", ""
+        try:
+            con = self._conn()
+            rows = con.execute(
+                "SELECT month, content FROM monthly WHERE session=? AND month != ? "
+                "UNION ALL SELECT week, content FROM weekly WHERE session=? AND week != ?",
+                (session, cur_month, session, cur_week),
+            ).fetchall()
+            con.close()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[layered_memory] 取召回候选失败: {e}")
+            return "", ""
+        rows = [(k, c) for k, c in rows if c]
+        if not rows:
+            return "", ""
+
+        vecs = self._embed([EMBED_QUERY_PREFIX + text] + [c for _, c in rows])
+        if len(vecs) != len(rows) + 1:
+            return "", ""
+        q = np.array(vecs[0])
+        qn = np.linalg.norm(q) or 1.0
+        scored = []
+        for i, (key, content) in enumerate(rows):
+            d = np.array(vecs[i + 1])
+            cos = float(q @ d / (qn * (np.linalg.norm(d) or 1.0)))
+            scored.append((cos, key, content))
+        scored.sort(reverse=True)
+
+        best = scored[0]
+        second = scored[1][0] if len(scored) > 1 else 0.0
+        if best[0] < self.recall_threshold:
+            return "", ""
+        # 分差太小说明没有明显更相关的，宁可不注入
+        if best[0] - second < self.recall_margin and best[0] < 0.6:
+            return "", ""
+        return best[1], best[2]
 
     def _recall(self, session: str, text: str, cur_month: str, cur_week: str) -> str:
         """按关键词从更早的月/周纪要里找回一条最相关的。

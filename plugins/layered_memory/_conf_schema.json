@@ -108,5 +108,33 @@
     "type": "int",
     "default": 2,
     "hint": "召回太多会挤占上下文，2 条一般够用。"
+  },
+  "recall_mode": {
+    "description": "召回方式",
+    "type": "string",
+    "options": [
+      "keyword",
+      "vector",
+      "hybrid"
+    ],
+    "labels": [
+      "只看字面重合",
+      "只用向量语义",
+      "先向量再退回字面"
+    ],
+    "default": "hybrid",
+    "hint": "向量靠本地 bge-small-zh 模型，能理解改写；字面匹配更稳但只认原词。"
+  },
+  "recall_threshold": {
+    "description": "向量召回阈值",
+    "type": "float",
+    "default": 0.45,
+    "hint": "相似度低于这个值就不注入。实测同一件事约 0.5-0.65，无关的约 0.2-0.35。"
+  },
+  "recall_margin": {
+    "description": "向量召回最小分差",
+    "type": "float",
+    "default": 0.05,
+    "hint": "第一名要明显高于第二名才注入，避免勉强匹配。"
   }
 }

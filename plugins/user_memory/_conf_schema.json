@@ -70,5 +70,23 @@
     "type": "bool",
     "default": true,
     "hint": "每周一 04:30 把所有档案压缩一遍，清理过时信息。"
+  },
+  "relation_enabled": {
+    "description": "自动推断群友关系",
+    "type": "bool",
+    "default": true,
+    "hint": "每天从群聊里按人聚合发言，让模型用一句话概括他是什么样的人、该怎么对待他。"
+  },
+  "relation_min_msgs": {
+    "description": "推关系所需的最少发言数",
+    "type": "int",
+    "default": 30,
+    "hint": "一周内发言少于这个数就不推，避免样本太少推歪。"
+  },
+  "debug_dump_prompt": {
+    "description": "导出系统提示词（调试用）",
+    "type": "bool",
+    "default": false,
+    "hint": "打开后每轮把拼好的 system prompt 写到插件目录的 prompt_dump.txt，看完记得关掉。"
   }
 }

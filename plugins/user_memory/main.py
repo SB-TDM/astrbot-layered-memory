@@ -37,6 +37,10 @@ MIN_INTERVAL = 300           # 同一个号两次抽取的最小间隔（秒）
 COMMIT_FILE = Path(__file__).resolve().parent / "commitments.json"
 COMMIT_KEEP_DAYS = 30          # 承诺/约定的保留天数
 COMMIT_MAX = 12                # 每人最多几条承诺
+HISTORY_DB = DATA_DIR / "data_v4.db"    # AstrBot 的群消息历史
+RELATION_MIN_MSGS = 30         # 至少攒这么多条群消息才推关系
+RELATION_AT = (5, 10)          # 每天 05:10 重推一次关系
+RELATION_BATCH = 6             # 一次最多处理几个人
 CORE_DB = DATA_DIR / "plugins" / "layered_memory" / "memories.db"
 
 EXTRACT_SYSTEM = (
@@ -65,6 +69,20 @@ EXTRACT_TEMPLATE = """下面是「用户」和「助手」的一轮对话，请�
 请输出两部分，只输出 JSON：
 - facts：合并后的**完整**档案（已有 + 新增，去重，最多 {max_facts} 条）
 - commitments：本轮新出现的承诺（没有就空数组）"""
+
+RELATION_PROMPT = """下面是一个 QQ 群里某个人最近的发言，请用一句话概括他在这群里的样子。
+
+要求：
+- 只写一句，40 字以内，不要分条。
+- 说清三件事之一即可：他是什么样的人、他在群里干什么、我该怎么对待他。
+- 基于发言判断，不要编，拿不准就写得模糊点。
+- 不要写"他说话很多"这种废话。
+
+昵称：{nick}
+发言：
+{lines}
+
+只输出那一句话，不要解释。"""
 
 COMPACT_PROMPT = """下面是一个用户的长期档案，可能包含重复、过时或互相矛盾的条目。
 
@@ -106,6 +124,10 @@ class UserMemory(Star):
         self.compact_threshold = self._cfg("compact_threshold", COMPACT_THRESHOLD, int)
         self.compact_target = self._cfg("compact_target", COMPACT_TARGET, int)
         self.weekly_compact = self._cfg("weekly_compact", True, bool)
+        self.relation_enabled = self._cfg("relation_enabled", True, bool)
+        self.relation_min_msgs = self._cfg("relation_min_msgs", RELATION_MIN_MSGS, int)
+        self.debug_dump = self._cfg("debug_dump_prompt", False, bool)
+        self._last_relation_day = ""
         self._last_run: dict[str, float] = {}
         self._task: asyncio.Task | None = None
         self._last_compact_day = ""
@@ -174,12 +196,15 @@ class UserMemory(Star):
         prof = self._load().get(uid) or {}
         facts = [f for f in prof.get(FACTS_KEY, []) if f] if self.inject_profile else []
         if facts:
-            nick = event.get_sender_name() or prof.get("name") or uid
+            nick = prof.get("alias") or event.get_sender_name() or prof.get("name") or uid
             lines = [
                 "关于正在跟你说话的这个人（你以前记下来的，别当新信息问）：",
                 f"- QQ {uid}，昵称 {nick}",
             ]
             lines += [f"- {f}" for f in facts]
+            relation = (prof.get("relation") or "").strip()
+            if relation:
+                lines.append(f"- 关系：{relation}")
             lines.append("自然地用这些信息就行，别复述，也别一条条念出来。")
             blocks.append("\n".join(lines))
 
@@ -204,6 +229,15 @@ class UserMemory(Star):
 
         if blocks:
             req.system_prompt = (req.system_prompt or "") + "\n\n" + "\n\n".join(blocks)
+
+        # 调试用：把最终拼好的 system prompt 落一份到插件目录
+        if self.debug_dump:
+            try:
+                (Path(__file__).resolve().parent / "prompt_dump.txt").write_text(
+                    req.system_prompt or "", encoding="utf-8"
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     def _read_affection(self, uid: str, gid: str) -> int | None:
         """按账号读好感度：取该 QQ 在所有会话里的最高值。
@@ -293,6 +327,7 @@ class UserMemory(Star):
                 data = self._load()
                 data[uid] = {
                     "name": nick,
+                    "alias": (data.get(uid) or {}).get("alias", ""),
                     "facts": merged,
                     "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
                 }
@@ -441,6 +476,98 @@ class UserMemory(Star):
             commits = []
         return [str(f) for f in facts], [str(c) for c in commits if str(c).strip()]
 
+    # ---------- 关系推断 ----------
+
+    def _group_messages_by_user(self, min_msgs: int) -> dict[str, list[str]]:
+        """从 AstrBot 的群消息历史里按人聚合发言。
+
+        用 platform_message_history 而不是分层记忆的原文，是因为原文只在
+        她回复过的那一轮才记录，覆盖不到没接话的人。
+
+        Args:
+            min_msgs: 至少多少条才纳入。
+
+        Returns:
+            {QQ号: [发言, ...]}，只包含够条数的人。
+        """
+        if not HISTORY_DB.exists():
+            return {}
+        try:
+            con = sqlite3.connect(f"file:{HISTORY_DB}?mode=ro", uri=True)
+            rows = con.execute(
+                "SELECT sender_id, content FROM platform_message_history "
+                "WHERE user_id LIKE '%GroupMessage%' AND sender_name != 'bot' "
+                "AND created_at > datetime('now', '-14 day') ORDER BY id ASC"
+            ).fetchall()
+            con.close()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[user_memory] 读群消息历史失败: {e}")
+            return {}
+        buckets: dict[str, list[str]] = {}
+        for who, content in rows:
+            if not who or not content:
+                continue
+            text = str(content)
+            # 历史里存的是 JSON 结构，简单取 message 文本，取不到就跳过
+            if text.startswith("{"):
+                try:
+                    payload = json.loads(text)
+                    parts = payload.get("message") or []
+                    text = "".join(
+                        str(p.get("text") or p.get("data") or "")
+                        for p in parts if isinstance(p, dict)
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+            text = text.strip()[:120]
+            if not text:
+                continue
+            buckets.setdefault(str(who), []).append(text)
+        return {k: v[-40:] for k, v in buckets.items() if len(v) >= min_msgs}
+
+    async def _build_relations(self) -> int:
+        """给群友推一句话的关系描述，写进档案的 relation 字段。
+
+        Returns:
+            实际更新的档案数。
+        """
+        if not self.relation_enabled:
+            return 0
+        provider = await self.context.get_using_provider_async()
+        if not provider:
+            return 0
+        buckets = self._group_messages_by_user(self.relation_min_msgs)
+        if not buckets:
+            return 0
+
+        updated = 0
+        for uid, lines in list(buckets.items())[:RELATION_BATCH]:
+            data = self._load()
+            prof = data.get(uid) or {}
+            nick = prof.get("alias") or prof.get("name") or uid
+            try:
+                resp = await provider.text_chat(
+                    prompt=RELATION_PROMPT.format(nick=nick, lines="\n".join(lines)),
+                    persist=False,
+                )
+                text = (getattr(resp, "completion_text", "") or "").strip()
+                text = text.splitlines()[0].strip().strip('"“”') if text else ""
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[user_memory] 推关系失败 {uid}: {e}")
+                continue
+            if not text or len(text) > 60:
+                continue
+            async with self._io_lock:
+                data = self._load()
+                entry = data.get(uid) or {"name": nick, "facts": []}
+                entry["relation"] = text
+                entry["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                data[uid] = entry
+                self._save(data)
+            updated += 1
+            logger.info(f"[user_memory] 关系 {nick}: {text}")
+        return updated
+
     # ---------- 压缩 ----------
 
     async def _compact(self, uid: str) -> int:
@@ -498,24 +625,36 @@ class UserMemory(Star):
             logger.info("[user_memory] 档案压缩定时器已启动")
 
     async def _compact_loop(self) -> None:
+        """每分钟醒一次：周日压缩档案，每天到点推群友关系。"""
         while True:
             try:
                 await asyncio.sleep(60)
                 now = time.localtime()
-                if not self.weekly_compact:
-                    continue
-                if (now.tm_hour, now.tm_min) != COMPACT_AT or now.tm_wday != 0:
-                    continue
                 today = time.strftime("%Y-%m-%d")
-                if self._last_compact_day == today:
-                    continue
-                self._last_compact_day = today
-                for uid in list(self._load().keys()):
-                    await self._compact(uid)
+
+                if (
+                    self.weekly_compact
+                    and (now.tm_hour, now.tm_min) == COMPACT_AT
+                    and now.tm_wday == 0
+                    and self._last_compact_day != today
+                ):
+                    self._last_compact_day = today
+                    for uid in list(self._load().keys()):
+                        await self._compact(uid)
+
+                if (
+                    self.relation_enabled
+                    and (now.tm_hour, now.tm_min) >= RELATION_AT
+                    and self._last_relation_day != today
+                ):
+                    self._last_relation_day = today
+                    n = await self._build_relations()
+                    if n:
+                        logger.info(f"[user_memory] 本次更新了 {n} 个人的关系")
             except asyncio.CancelledError:
                 return
             except Exception as e:  # noqa: BLE001
-                logger.error(f"[user_memory] 压缩定时器异常: {e}")
+                logger.error(f"[user_memory] 定时器异常: {e}")
 
     # ---------- commands ----------
 
@@ -551,6 +690,44 @@ class UserMemory(Star):
             )
         else:
             yield event.plain_result("还没到需要压缩的程度")
+
+    @filter.command("推关系")
+    async def rebuild_relations(self, event: AstrMessageEvent):
+        """立刻根据群聊重新推断群友关系（仅号主）"""
+        if str(event.get_sender_id() or "") != OWNER_UIN:
+            yield event.plain_result("只有号主能触发")
+            return
+        n = await self._build_relations()
+        data = self._load()
+        lines = []
+        for uid, v in data.items():
+            rel = (v.get("relation") or "").strip()
+            if rel:
+                lines.append(f"{v.get('alias') or v.get('name') or uid}：{rel}")
+        if not lines:
+            yield event.plain_result("推不出来，可能群聊样本还不够")
+            return
+        yield event.plain_result(f"更新了 {n} 个\n" + "\n".join(lines))
+
+    @filter.command("别名")
+    async def set_alias(self, event: AstrMessageEvent):
+        """给某个号设别名：/别名 2738551305 猴子"""
+        if str(event.get_sender_id() or "") != OWNER_UIN:
+            yield event.plain_result("只有号主能改")
+            return
+        parts = (event.message_str or "").replace("/别名", "").split()
+        if len(parts) < 2:
+            yield event.plain_result("用法：/别名 2738551305 猴子")
+            return
+        uid, alias = parts[0], parts[1]
+        async with self._io_lock:
+            data = self._load()
+            entry = data.get(uid) or {"name": uid, "facts": []}
+            entry["alias"] = alias
+            entry["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            data[uid] = entry
+            self._save(data)
+        yield event.plain_result(f"{uid} 的别名设成「{alias}」了")
 
     @filter.command("忘记", alias={"forget"})
     async def forget_me(self, event: AstrMessageEvent):

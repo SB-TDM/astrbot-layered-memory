@@ -24,6 +24,21 @@ cp -r plugins/* /path/to/AstrBot/data/plugins/
 
 依赖 AstrBot >= 4.29。`user_memory` 的好感度功能需要另外装 `astrbot_plugin_self_learning`，没装会自动跳过。
 
+想用向量召回（`recall_mode = vector/hybrid`）需要装 fastembed：
+
+```bash
+pip install fastembed
+```
+
+首次运行会自动下载 `BAAI/bge-small-zh-v1.5`（约 90 MB）到 `data/plugin_data/embeddings/`。国内网络建议先设好镜像：
+
+```bash
+set HF_ENDPOINT=https://hf-mirror.com
+set HF_HUB_DISABLE_XET=1
+```
+
+插件内部已经默认设了这两个变量，手动装时设上能少踩坑。
+
 **装完要改占位符**（只影响权限判断）：
 
 ```bash
@@ -112,7 +127,17 @@ L2 月纪要（5–7 句）
 
 每轮只注入「最近一份月/周纪要」，更早的纪要虽然永久保存，但默认不会出现在上下文里。
 
-为了让旧事能被翻出来，插件会拿你这轮说的话去历史纪要里做关键词匹配（中文按二字切片，不依赖分词库）：
+为了让旧事能被翻出来，插件会拿你这轮说的话去历史纪要里找相关的。支持三种方式（`recall_mode`）：
+
+| 方式 | 做法 | 特点 |
+|---|---|---|
+| `keyword` | 中文二字切片做字面匹配 | 不用装任何东西，但只认原词 |
+| `vector` | 本地向量模型算语义相似度 | 能理解改写，需要 fastembed |
+| `hybrid`（默认） | 先向量，没命中再退回字面 | 兼顾两边 |
+
+向量用的是 `BAAI/bge-small-zh-v1.5`（90 MB，CPU 推理 10–20 ms），装在项目自己的 venv 里，数据不出机器。
+
+字面匹配长这样（中文按二字切片，不依赖分词库）：
 
 ```
 你说：上次说的那个北京出差还记得吗
@@ -190,6 +215,9 @@ raw 里有哪些日期  −  daily 里已有哪几天  =  需要补的
 | `cross_session_recent` | `false` | 注入其他会话的即时摘要（默认关，各会话完全隔离） |
 | `cross_fresh_minutes` | `120` | 跨会话摘要的有效期（分钟） |
 | `cross_in_group` | `false` | 群里也注入其他会话摘要（默认单向：只有私聊能看到群摘要） |
+| `recall_mode` | `hybrid` | 召回方式：`keyword` / `vector` / `hybrid` |
+| `recall_threshold` | `0.45` | 向量相似度低于这个值不注入 |
+| `recall_margin` | `0.05` | 第一名要比第二名高这么多才注入 |
 | `recent_trigger` | `turns` | L5 刷新方式：`turns` 按轮数 / `hybrid` 按时间+条数 |
 | `recent_interval_minutes` | `5` | hybrid 模式的刷新间隔 |
 | `recent_min_messages` | `5` | hybrid 模式最少新增消息数 |
@@ -248,6 +276,8 @@ raw 里有哪些日期  −  daily 里已有哪几天  =  需要补的
 | 权限隔离 | 看别人档案需要管理员 |
 | 承诺单存 | 约定/计划单独保存并每轮注入，不会因为原文过期而丢 |
 | 冲突过滤 | 抽取时带上 L1 内核，和设定冲突的信息不记 |
+| 固定别名 | QQ 昵称随时会改，别名优先，不会被覆盖 |
+| 关系推断 | 每天从群聊发言里推一句话「他是什么样的人、该怎么待他」 |
 
 ### 命令
 
@@ -257,6 +287,8 @@ raw 里有哪些日期  −  daily 里已有哪几天  =  需要补的
 | `/记忆 <QQ号>` | 看别人的档案（仅管理员） |
 | `/忘记` | 清空自己的档案 |
 | `/压缩档案` | 立刻压缩自己的档案 |
+| `/别名 <QQ> <名字>` | 给某人设固定名字，不随 QQ 昵称变 |
+| `/推关系` | 根据群聊重新推断每个人的关系描述 |
 
 ### 配置项
 
@@ -274,6 +306,9 @@ raw 里有哪些日期  −  daily 里已有哪几天  =  需要补的
 | `compact_threshold` | `15` | 触发压缩的条数 |
 | `compact_target` | `10` | 压缩后保留条数 |
 | `weekly_compact` | `true` | 每周全量压缩 |
+| `relation_enabled` | `true` | 自动推断群友关系 |
+| `relation_min_msgs` | `30` | 至少多少条群发言才推关系 |
+| `debug_dump_prompt` | `false` | 把拼好的 system prompt 导出到文件（调试用） |
 
 ---
 
