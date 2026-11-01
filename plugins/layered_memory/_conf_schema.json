@@ -136,5 +136,53 @@
     "type": "float",
     "default": 0.05,
     "hint": "第一名要明显高于第二名才注入，避免勉强匹配。"
+  },
+  "group_daily_inject": {
+    "description": "群聊注入几条日纪要",
+    "type": "int",
+    "default": 1,
+    "hint": "群聊信息密度高，一天一条通常够用。"
+  },
+  "group_skip_periodic": {
+    "description": "群聊不注入周/月纪要",
+    "type": "bool",
+    "default": true,
+    "hint": "改为靠向量召回按需取，省下每轮的固定开销。"
+  },
+  "group_recent_trigger": {
+    "description": "群聊 L5 刷新方式",
+    "type": "string",
+    "options": [
+      "turns",
+      "hybrid"
+    ],
+    "default": "hybrid",
+    "hint": "群聊刷屏快，用时间+条数更跟得上。"
+  },
+  "group_recent_interval": {
+    "description": "群聊刷新间隔（分钟）",
+    "type": "int",
+    "default": 15
+  },
+  "group_recent_min": {
+    "description": "群聊最少新增条数",
+    "type": "int",
+    "default": 8
+  },
+  "group_recall_mode": {
+    "description": "群聊召回方式",
+    "type": "string",
+    "options": [
+      "keyword",
+      "vector",
+      "hybrid"
+    ],
+    "default": "vector",
+    "hint": "群聊话题跳得快，靠语义比字面稳。"
+  },
+  "group_recall_max": {
+    "description": "群聊最多召回几条",
+    "type": "int",
+    "default": 3
   }
 }

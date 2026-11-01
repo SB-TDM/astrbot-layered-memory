@@ -17,12 +17,13 @@ Commands:
 """
 
 import asyncio
+import json
 import re
 import numpy as np
 import os
 import sqlite3
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from astrbot.api import logger
@@ -135,6 +136,15 @@ class LayeredMemory(Star):
         self.recall_mode = self._cfg("recall_mode", "hybrid", str)
         self.recall_threshold = self._cfg("recall_threshold", 0.45, float)
         self.recall_margin = self._cfg("recall_margin", 0.05, float)
+        # 群聊单独一套：窗口更小、靠向量召回、不注入周月
+        self.group_daily_inject = self._cfg("group_daily_inject", 1, int)
+        self.group_skip_periodic = self._cfg("group_skip_periodic", True, bool)
+        self.group_recent_trigger = self._cfg("group_recent_trigger", "hybrid", str)
+        self.group_recent_interval = self._cfg("group_recent_interval", 15, int)
+        self.group_recent_min_msgs = self._cfg("group_recent_min", 8, int)
+        self.group_recall_mode = self._cfg("group_recall_mode", "vector", str)
+        self.group_recall_max = self._cfg("group_recall_max", 3, int)
+        self.history_db = Path(__file__).resolve().parents[2] / "data_v4.db"
         self._embedder = None
         self._init_db()
         self._task: asyncio.Task | None = None
@@ -226,9 +236,11 @@ class LayeredMemory(Star):
                 "SELECT week, content FROM weekly WHERE session=? "
                 "ORDER BY week DESC LIMIT 1", (session,)
             ).fetchone()
+            is_group = self._is_group(session)
+            want_daily = self.group_daily_inject if is_group else self.daily_inject
             dailies = con.execute(
                 "SELECT day, content FROM daily WHERE session=? "
-                "ORDER BY day DESC LIMIT ?", (session, self.daily_inject)
+                "ORDER BY day DESC LIMIT ?", (session, want_daily)
             ).fetchall()
             recent = con.execute(
                 "SELECT content FROM recent WHERE session=?", (session,)
@@ -238,9 +250,10 @@ class LayeredMemory(Star):
             blocks: list[str] = []
             if core and core[0]:
                 blocks.append("【你记得的他】\n" + core[0][:self.core_max_chars])
-            if month:
+            skip_periodic = is_group and self.group_skip_periodic
+            if month and not skip_periodic:
                 blocks.append(f"【上个月概要】\n{month[1][:300]}")
-            if week:
+            if week and not skip_periodic:
                 blocks.append(f"【这周概要】\n{week[1][:300]}")
             if dailies:
                 blocks.append(
@@ -252,7 +265,8 @@ class LayeredMemory(Star):
 
             # 旧纪要召回：本月之外的月/周纪要默认不注入，但用户提到相关词时翻出来
             if self.recall_enabled:
-                mode = str(self.recall_mode).lower()
+                mode = (self.group_recall_mode if is_group else self.recall_mode)
+                mode = str(mode).lower()
                 text = event.get_message_str() or ""
                 cur_m = month[0] if month else ""
                 cur_w = week[0] if week else ""
@@ -365,6 +379,10 @@ class LayeredMemory(Star):
             "SELECT role, content FROM raw WHERE session=? AND ts >= ? AND ts < ? ORDER BY ts ASC",
             (session, day_start, day_end),
         ).fetchall()
+        if self._is_group(session):
+            hist = self._history_rows(session, day_start, day_end)
+            if len(hist) > len(rows):
+                rows = hist
         con.close()
         if not rows:
             return ""
@@ -428,10 +446,11 @@ class LayeredMemory(Star):
         """L3 -> L2：上个月的周纪要压成月纪要。"""
         month = month or month_key()
         con = self._conn()
-        rows = con.execute(
-            "SELECT week, content FROM weekly WHERE session=? AND week LIKE ? ORDER BY week ASC",
-            (session, month[:4] + "%"),
+        all_weeks = con.execute(
+            "SELECT week, content FROM weekly WHERE session=? ORDER BY week ASC",
+            (session,),
         ).fetchall()
+        rows = [(w, c) for w, c in all_weeks if self._week_in_month(w, month)]
         if not rows:
             rows = con.execute(
                 "SELECT day, content FROM daily WHERE session=? AND day LIKE ? ORDER BY day ASC",
@@ -622,6 +641,84 @@ class LayeredMemory(Star):
         lines = [f"{key}：{content[:220]}" for _, key, _, content in picked]
         return "【以前聊过的相关记录】\n" + "\n".join(lines)
 
+    @staticmethod
+    def _week_in_month(week: str, month: str) -> bool:
+        """判断某个 ISO 周的多数天数是否落在指定月份。
+
+        跨月的周（例如周一到 10-31、周日到 11-01）按天数归属，
+        一周里至少有 4 天在该月才算这个月的周。
+
+        Args:
+            week: 形如 2026-W44。
+            month: 形如 2026-10。
+
+        Returns:
+            属于这个月返回 True。
+        """
+        try:
+            year, wnum = week.split("-W")
+            monday = date.fromisocalendar(int(year), int(wnum), 1)
+            y, m = month.split("-")
+            inside = sum(
+                1 for i in range(7) if (monday + timedelta(days=i)).month == int(m)
+            )
+            return inside >= 4
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _history_rows(self, session: str, day_start: float, day_end: float) -> list[tuple[str, str]]:
+        """从 AstrBot 的群消息历史里取某一天的消息。
+
+        群聊里她大部分时间不出声，原文表（raw）只在她回复时才有记录，
+        所以群纪要改从全量历史里取，覆盖所有发言。
+
+        Args:
+            session: 会话标识，形如 snowluma:GroupMessage:xxx。
+            day_start: 当天 0 点的时间戳。
+            day_end: 次日 0 点的时间戳。
+
+        Returns:
+            [(role, content), ...]，按时间升序；取不到返回空列表。
+        """
+        if not self.history_db.exists():
+            return []
+        start = datetime.fromtimestamp(day_start).strftime("%Y-%m-%d %H:%M:%S")
+        end = datetime.fromtimestamp(day_end).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            con = sqlite3.connect(f"file:{self.history_db}?mode=ro", uri=True)
+            rows = con.execute(
+                "SELECT sender_name, content FROM platform_message_history "
+                "WHERE user_id = ? AND created_at >= ? AND created_at < ? ORDER BY id ASC",
+                (session, start, end),
+            ).fetchall()
+            con.close()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[layered_memory] 读群历史失败: {e}")
+            return []
+
+        out: list[tuple[str, str]] = []
+        for name, content in rows:
+            text = str(content or "")
+            if text.startswith("{"):
+                try:
+                    payload = json.loads(text)
+                    parts = payload.get("message") or []
+                    text = "".join(
+                        str(p.get("text") or "")
+                        for p in parts if isinstance(p, dict) and p.get("type") == "plain"
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+            text = text.strip()[:200]
+            if text:
+                out.append(("bot" if name == "bot" else "user", text))
+        return out
+
+    @staticmethod
+    def _is_group(session: str) -> bool:
+        """判断是不是群会话。"""
+        return "GroupMessage" in (session or "")
+
     def _reload_times(self) -> None:
         """从配置文件重读三个纪要时间，改了不用重启。
 
@@ -687,14 +784,30 @@ class LayeredMemory(Star):
                 (session, since),
             ).fetchone()[0]
             con.close()
+            if self._is_group(session):
+                since_str = datetime.fromtimestamp(since or 0).strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    hcon = sqlite3.connect(f"file:{self.history_db}?mode=ro", uri=True)
+                    n = hcon.execute(
+                        "SELECT COUNT(*) FROM platform_message_history "
+                        "WHERE user_id = ? AND sender_name != 'bot' AND created_at > ?",
+                        (session, since_str),
+                    ).fetchone()[0]
+                    hcon.close()
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as e:  # noqa: BLE001
             logger.error(f"[layered_memory] 判断 L5 失败: {e}")
             return False
 
-        if str(self.recent_trigger).lower() == "hybrid":
-            if n < self.recent_min_msgs:
+        is_group = self._is_group(session)
+        trigger = self.group_recent_trigger if is_group else self.recent_trigger
+        if str(trigger).lower() == "hybrid":
+            min_msgs = self.group_recent_min_msgs if is_group else self.recent_min_msgs
+            interval = self.group_recent_interval if is_group else self.recent_interval
+            if n < min_msgs:
                 return False
-            return (time.time() - since) >= self.recent_interval * 60
+            return (time.time() - since) >= interval * 60
         return n >= self.recent_turns
 
     async def _refresh_recent(self, session: str) -> None:
@@ -794,7 +907,7 @@ class LayeredMemory(Star):
             return
         self._reload_times()
         # hybrid 模式：消息停止后也要能到点刷新，所以顺带扫一遍
-        if str(self.recent_trigger).lower() == "hybrid":
+        if str(self.recent_trigger).lower() == "hybrid" or str(self.group_recent_trigger).lower() == "hybrid":
             try:
                 con = self._conn()
                 sessions = [r[0] for r in con.execute("SELECT DISTINCT session FROM raw")]
