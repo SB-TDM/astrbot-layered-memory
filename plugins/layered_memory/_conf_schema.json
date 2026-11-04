@@ -184,5 +184,17 @@
     "description": "群聊最多召回几条",
     "type": "int",
     "default": 3
+  },
+  "internal_provider_id": {
+    "description": "内部任务用的模型 ID",
+    "type": "string",
+    "default": "deepseek",
+    "hint": "摘要、抽取、关系推断这类机械活用非推理模型更省；留空则用默认模型。聊天回复不受影响。"
+  },
+  "owner_uin": {
+    "description": "号主 QQ 号",
+    "type": "string",
+    "default": "",
+    "hint": "填你的 QQ 号。群聊纪要里会把你标成「他」，承诺与管理命令也只认这个号。"
   }
 }

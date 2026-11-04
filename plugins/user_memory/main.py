@@ -23,6 +23,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 
+OWNER_UIN = ""  # 号主 QQ，由 owner_uin 配置项填充
 PROFILE_FILE = Path(__file__).resolve().parent / "profiles.json"
 # 插件目录是 data/plugins/user_memory，往上两级是 data/
 DATA_DIR = Path(__file__).resolve().parents[2]
@@ -65,6 +66,9 @@ EXTRACT_TEMPLATE = """下面是「用户」和「助手」的一轮对话，请�
 本轮对话：
 用户：{user_text}
 助手：{reply}
+
+写档案时用第一人称：说你自己用「我」，说他用「他」。
+不要用「助手」这种第三人称称呼自己。
 
 请输出两部分，只输出 JSON：
 - facts：合并后的**完整**档案（已有 + 新增，去重，最多 {max_facts} 条）
@@ -126,12 +130,18 @@ class UserMemory(Star):
         self.weekly_compact = self._cfg("weekly_compact", True, bool)
         self.relation_enabled = self._cfg("relation_enabled", True, bool)
         self.relation_min_msgs = self._cfg("relation_min_msgs", RELATION_MIN_MSGS, int)
+        self.hide_profile_in_group = self._cfg("hide_profile_in_group", True, bool)
+        self.mood_max_age_hours = self._cfg("mood_max_age_hours", 8, int)
+        self.mood_fallback = self._cfg("mood_fallback", True, bool)
+        self.hide_commitments_in_group = self._cfg("hide_commitments_in_group", True, bool)
         self.debug_dump = self._cfg("debug_dump_prompt", False, bool)
         self._last_relation_day = ""
         self._last_run: dict[str, float] = {}
         self._task: asyncio.Task | None = None
         self._last_compact_day = ""
         self._io_lock = asyncio.Lock()
+        global OWNER_UIN
+        OWNER_UIN = str(self._cfg("owner_uin", "", str)).strip() or OWNER_UIN
 
     def _cfg(self, key: str, default, cast):
         """读插件配置项，读不到就用默认值。
@@ -156,6 +166,19 @@ class UserMemory(Star):
             return cast(value)
         except (TypeError, ValueError):
             return default
+
+    async def _internal_provider(self):
+        """内部任务（摘要/抽取/关系）优先用非推理模型。
+
+        Returns:
+            Provider 实例；配置的 ID 取不到时回退到默认 provider。
+        """
+        pid = str(self._cfg("internal_provider_id", "", str)).strip()
+        if pid:
+            prov = self.context.get_provider_by_id(pid)
+            if prov:
+                return prov
+        return await self.context.get_using_provider_async()
 
     # ---------- storage ----------
 
@@ -194,7 +217,9 @@ class UserMemory(Star):
         blocks: list[str] = []
 
         prof = self._load().get(uid) or {}
-        facts = [f for f in prof.get(FACTS_KEY, []) if f] if self.inject_profile else []
+        in_group = "GroupMessage" in str(event.unified_msg_origin or "")
+        allow_facts = self.inject_profile and not (in_group and self.hide_profile_in_group)
+        facts = [f for f in prof.get(FACTS_KEY, []) if f] if allow_facts else []
         if facts:
             nick = prof.get("alias") or event.get_sender_name() or prof.get("name") or uid
             lines = [
@@ -210,7 +235,9 @@ class UserMemory(Star):
 
         # 好感度：群聊按群号查，私聊按对方 QQ 号查
         # 承诺/约定：条数少、期限长，每轮都带上，避免"答应过的事"被忘掉
-        commits = self._load_commitments().get(uid) or []
+        commits = [] if in_group and self.hide_commitments_in_group else (
+            self._load_commitments().get(uid) or []
+        )
         if commits:
             lines = [f"- {c.get('text', '')}" for c in commits if c.get("text")]
             if lines:
@@ -220,6 +247,14 @@ class UserMemory(Star):
                 )
 
         gid = str(event.get_group_id() or uid)
+
+        mood = self._read_mood(uid, gid)
+        if mood and mood.get("desc"):
+            blocks.append(
+                f"【你现在的情绪】{mood['type']}（强度 {mood['intensity']:.2f}）：{mood['desc']}\n"
+                "带着这个情绪说话，语气自然受影响；但别直接把情绪名念出来，也别解释自己在什么情绪里。"
+            )
+
         affection = self._read_affection(uid, gid) if self.inject_affection else None
         if affection is not None:
             blocks.append(
@@ -294,7 +329,7 @@ class UserMemory(Star):
     async def _extract(self, uid: str, nick: str, user_text: str, reply: str) -> None:
         """调用一次模型，把这一轮里的稳定信息合并进档案。"""
         try:
-            provider = await self.context.get_using_provider_async()
+            provider = await self._internal_provider()
             if not provider:
                 return
 
@@ -337,6 +372,74 @@ class UserMemory(Star):
                 asyncio.create_task(self._compact(uid))
         except Exception as e:  # noqa: BLE001
             logger.error(f"[user_memory] 抽取失败 uid={uid}: {e}")
+
+    def _read_mood(self, uid: str, gid: str) -> dict | None:
+        """读当前活跃情绪。
+
+        Args:
+            uid: 对方 QQ 号。
+            gid: 当前会话标识。
+
+        Returns:
+            {"type","intensity","desc"}；没有活跃情绪返回 None。
+        """
+        if not AFFECTION_DB.exists():
+            return None
+        try:
+            con = sqlite3.connect(f"file:{AFFECTION_DB}?mode=ro", uri=True)
+            row = con.execute(
+                "SELECT mood_type, mood_intensity, mood_description FROM bot_mood "
+                "WHERE is_active=1 AND group_id IN (?, ?) ORDER BY timestamp DESC LIMIT 1",
+                (uid, gid),
+            ).fetchone()
+            con.close()
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[user_memory] 读情绪失败: {e}")
+            return None
+        if not row:
+            return self._fallback_mood()
+
+        # 数据库里的情绪如果太旧，就按当前时段给个合理状态，
+        # 否则她会连着一天都是"昨天下午的开心"。
+        try:
+            con = sqlite3.connect(f"file:{AFFECTION_DB}?mode=ro", uri=True)
+            ts = con.execute(
+                "SELECT timestamp FROM bot_mood WHERE is_active=1 AND group_id IN (?, ?) "
+                "ORDER BY timestamp DESC LIMIT 1",
+                (uid, gid),
+            ).fetchone()
+            con.close()
+            age_h = (time.time() - (ts[0] if ts else 0)) / 3600
+        except Exception:  # noqa: BLE001
+            age_h = 0
+
+        if age_h > self.mood_max_age_hours:
+            logger.info(f"[user_memory] 情绪已 {age_h:.1f} 小时未更新，按时段兜底")
+            return self._fallback_mood()
+        return {"type": row[0], "intensity": row[1] or 0, "desc": row[2] or ""}
+
+    def _fallback_mood(self) -> dict | None:
+        """按时段给一个合理的当前状态。
+
+        Returns:
+            {"type","intensity","desc"}；不需要时返回 None。
+        """
+        if not self.mood_fallback:
+            return None
+        h = __import__("datetime").datetime.now().hour
+        table = [
+            (0, 6, "sleepy", 0.5, "这个点有点困了，但还是想再聊两句"),
+            (6, 9, "dazed", 0.45, "刚醒，脑子还没转起来"),
+            (9, 12, "calm", 0.4, "上午还算清醒，慢慢来"),
+            (12, 14, "sleepy", 0.45, "午饭后犯困，有点懒"),
+            (14, 19, "calm", 0.4, "下午挺平稳的，不着急"),
+            (19, 22, "content", 0.5, "晚上放松下来了，心情不错"),
+            (22, 24, "sleepy", 0.55, "困了，但还不想睡"),
+        ]
+        for start, end, mt, inten, desc in table:
+            if start <= h < end:
+                return {"type": mt, "intensity": inten, "desc": desc}
+        return None
 
     # ---------- 承诺 ----------
 
@@ -533,7 +636,7 @@ class UserMemory(Star):
         """
         if not self.relation_enabled:
             return 0
-        provider = await self.context.get_using_provider_async()
+        provider = await self._internal_provider()
         if not provider:
             return 0
         buckets = self._group_messages_by_user(self.relation_min_msgs)
@@ -589,7 +692,7 @@ class UserMemory(Star):
             return 0
 
         try:
-            provider = await self.context.get_using_provider_async()
+            provider = await self._internal_provider()
             if not provider:
                 return 0
             prompt = COMPACT_PROMPT.format(

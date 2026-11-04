@@ -88,5 +88,41 @@
     "type": "bool",
     "default": false,
     "hint": "打开后每轮把拼好的 system prompt 写到插件目录的 prompt_dump.txt，看完记得关掉。"
+  },
+  "internal_provider_id": {
+    "description": "内部任务用的模型 ID",
+    "type": "string",
+    "default": "deepseek",
+    "hint": "摘要、抽取、关系推断这类机械活用非推理模型更省；留空则用默认模型。聊天回复不受影响。"
+  },
+  "hide_profile_in_group": {
+    "description": "群里不注入档案事实",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后群聊里只用人设、内核和群友关系，私聊记下的偏好和私事不会带进群。"
+  },
+  "hide_commitments_in_group": {
+    "description": "群里不注入承诺",
+    "type": "bool",
+    "default": true,
+    "hint": "私聊里的约定（比如欠着的事）不在群里提，避免当众说私事。"
+  },
+  "mood_max_age_hours": {
+    "description": "情绪过期时间（小时）",
+    "type": "int",
+    "default": 8,
+    "hint": "数据库里的情绪超过这个时间没更新，就按时段给一个合理的当前状态，避免整天停在旧情绪上。"
+  },
+  "mood_fallback": {
+    "description": "情绪过期时按时段兜底",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后只用数据库里的真实情绪，可能长时间不变。"
+  },
+  "owner_uin": {
+    "description": "号主 QQ 号",
+    "type": "string",
+    "default": "",
+    "hint": "填你的 QQ 号。群聊纪要里会把你标成「他」，承诺与管理命令也只认这个号。"
   }
 }

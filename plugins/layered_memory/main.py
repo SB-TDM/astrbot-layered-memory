@@ -37,7 +37,7 @@ EMBED_DIR = Path(__file__).resolve().parents[2] / "plugin_data" / "embeddings"
 EMBED_MODEL = "BAAI/bge-small-zh-v1.5"
 EMBED_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 
-OWNER_UIN = "YOUR_QQ_NUMBER"
+OWNER_UIN = ""  # 号主 QQ，由 owner_uin 配置项填充（不写死在代码里）
 RAW_KEEP_DAYS = 3
 DAILY_INJECT = 2
 RECENT_TURNS = 20          # L5 每收到这么多轮就刷新一次
@@ -63,7 +63,24 @@ DAILY_PROMPT = """下面是今天（{day}）我和「他」的聊天记录，请
 {chat}
 """
 
+GROUP_DAILY_PROMPT = """下面是今天（{day}）一个 QQ 群里的聊天记录，请压缩成 3 到 6 句的当日纪要。
+
+要求：
+- **这是多人群聊**，不是一对一。每个人前面都有昵称，写的时候要分清楚谁是谁。
+- 提到具体的人用昵称；「他」专指号主本人（{owner}）。
+- 别人的事就说「某某在…」，不要算到「他」头上。
+- 只留事实和情绪基调：聊了什么、谁状态如何、有没有约定或没说完的事。
+- 不要感慨，不要复述原话，不要写「今天聊了很多」这种空话。
+- 直接给纪要正文，不要加日期和标题。
+
+聊天记录：
+{chat}
+"""
+
 WEEKLY_PROMPT = """下面是这一周（{start} 到 {end}）的每日纪要，请压缩成 4 到 6 句的周纪要。
+
+注意：如果纪要里出现了人名（群友昵称），保留这些人名；「他」只指号主本人，
+不要把别人的事并到他头上。分不清是谁就写「有人」，不要瞎归。
 
 要求：
 - 合并重复的事，只留主线：这周主要聊了什么、他的状态起伏、有什么没解决的。
@@ -75,6 +92,9 @@ WEEKLY_PROMPT = """下面是这一周（{start} 到 {end}）的每日纪要，�
 """
 
 MONTHLY_PROMPT = """下面是这个月（{month}）的每周纪要，请压缩成 5 到 7 句的月纪要。
+
+注意：纪要里出现的人名要保留；「他」只指号主本人，别人的事不要并到他头上；
+分不清就写「有人」。
 
 要求：
 - 只留长期有意义的：关系变化、反复出现的话题、重要决定或约定。
@@ -148,6 +168,8 @@ class LayeredMemory(Star):
         self._embedder = None
         self._init_db()
         self._task: asyncio.Task | None = None
+        global OWNER_UIN
+        OWNER_UIN = str(self._cfg("owner_uin", "", str)).strip() or OWNER_UIN
         self._done: dict[str, str] = {}      # 防止同一时间点重复触发
         self._turn_count: dict[str, int] = {}
 
@@ -172,6 +194,19 @@ class LayeredMemory(Star):
         except Exception:  # noqa: BLE001
             pass
         return fallback
+
+    async def _internal_provider(self):
+        """内部任务（摘要/压缩）优先用非推理模型。
+
+        Returns:
+            Provider 实例；配置的 ID 取不到时回退到默认 provider。
+        """
+        pid = str(self._cfg("internal_provider_id", "", str)).strip()
+        if pid:
+            prov = self.context.get_provider_by_id(pid)
+            if prov:
+                return prov
+        return await self.context.get_using_provider_async()
 
     # ---------- storage ----------
 
@@ -347,7 +382,7 @@ class LayeredMemory(Star):
     # ---------- summaries ----------
 
     async def _call_llm(self, prompt: str) -> str:
-        provider = await self.context.get_using_provider_async()
+        provider = await self._internal_provider()
         if not provider:
             return ""
         try:
@@ -386,10 +421,17 @@ class LayeredMemory(Star):
         con.close()
         if not rows:
             return ""
-        chat = "\n".join(
-            f"{'我' if role == 'bot' else '他'}：{c}" for role, c in rows
-        )[-6000:]
-        summary = await self._call_llm(DAILY_PROMPT.format(day=day, chat=chat))
+        if self._is_group(session):
+            # 群聊的 rows 已经是 (昵称, 内容)
+            chat = "\n".join(f"{name}：{c}" for name, c in rows)[-6000:]
+            summary = await self._call_llm(
+                GROUP_DAILY_PROMPT.format(day=day, owner=OWNER_UIN, chat=chat)
+            )
+        else:
+            chat = "\n".join(
+                f"{'我' if role == 'bot' else '他'}：{c}" for role, c in rows
+            )[-6000:]
+            summary = await self._call_llm(DAILY_PROMPT.format(day=day, chat=chat))
         if not summary:
             return ""
         con = self._conn()
@@ -666,6 +708,25 @@ class LayeredMemory(Star):
         except Exception:  # noqa: BLE001
             return False
 
+    def _alias_map(self) -> dict:
+        """读 user_memory 的别名表，让群聊纪要也用人话称呼。
+
+        Returns:
+            {QQ号: 别名}；文件不存在时返回空字典。
+        """
+        path = Path(__file__).resolve().parents[2] / "plugins" / "user_memory" / "profiles.json"
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            return {}
+        return {
+            uid: (info.get("alias") or "").strip()
+            for uid, info in data.items()
+            if (info.get("alias") or "").strip()
+        }
+
     def _history_rows(self, session: str, day_start: float, day_end: float) -> list[tuple[str, str]]:
         """从 AstrBot 的群消息历史里取某一天的消息。
 
@@ -687,7 +748,7 @@ class LayeredMemory(Star):
         try:
             con = sqlite3.connect(f"file:{self.history_db}?mode=ro", uri=True)
             rows = con.execute(
-                "SELECT sender_name, content FROM platform_message_history "
+                "SELECT sender_id, sender_name, content FROM platform_message_history "
                 "WHERE user_id = ? AND created_at >= ? AND created_at < ? ORDER BY id ASC",
                 (session, start, end),
             ).fetchall()
@@ -697,7 +758,8 @@ class LayeredMemory(Star):
             return []
 
         out: list[tuple[str, str]] = []
-        for name, content in rows:
+        aliases = self._alias_map()
+        for sender_id, name, content in rows:
             text = str(content or "")
             if text.startswith("{"):
                 try:
@@ -711,7 +773,17 @@ class LayeredMemory(Star):
                     continue
             text = text.strip()[:200]
             if text:
-                out.append(("bot" if name == "bot" else "user", text))
+                if name == "bot":
+                    label = "我"
+                elif str(sender_id) == OWNER_UIN:
+                    label = "他"
+                else:
+                    label = (
+                        aliases.get(str(sender_id))
+                        or (name or "")[:12]
+                        or str(sender_id)
+                    )
+                out.append((label, text))
         return out
 
     @staticmethod
@@ -857,38 +929,32 @@ class LayeredMemory(Star):
             await asyncio.sleep(10)
             cutoff = time.time() - self.raw_keep_days * 86400
             con = self._conn()
-            raw_days = {
-                row[0]
+            # 按「日期 + 会话」比对，而不是只看日期：
+            # 私聊有纪要、群聊缺，也要能补出来
+            raw_pairs = {
+                (row[0], row[1])
                 for row in con.execute(
-                    "SELECT DISTINCT date(ts, 'unixepoch', 'localtime') FROM raw WHERE ts > ?",
-                    (cutoff,),
+                    "SELECT DISTINCT date(ts,'unixepoch','localtime'), session "
+                    "FROM raw WHERE ts > ?", (cutoff,)
                 )
             }
-            saved = {
-                row[0]
+            saved_pairs = {
+                (row[0], row[1])
                 for row in con.execute(
-                    "SELECT DISTINCT day FROM daily WHERE day >= date('now','localtime','-%d day')"
+                    "SELECT DISTINCT day, session FROM daily WHERE day >= date('now','localtime','-%d day')"
                     % max(self.raw_keep_days, 1)
                 )
             }
             con.close()
             today = today_str()
-            missing = sorted(d for d in raw_days - saved if d < today)
+            missing = sorted(
+                (d, s) for d, s in raw_pairs - saved_pairs if d < today
+            )
             if not missing:
                 return
-            logger.info(f"[layered_memory] 补生成纪要：{missing}")
-            for day in missing:
-                con = self._conn()
-                sessions = [
-                    r[0]
-                    for r in con.execute(
-                        "SELECT DISTINCT session FROM raw WHERE date(ts,'unixepoch','localtime')=?",
-                        (day,),
-                    )
-                ]
-                con.close()
-                for session in sessions:
-                    await self._summarize_session(session, day)
+            logger.info(f"[layered_memory] 补生成纪要：{len(missing)} 个会话-日期")
+            for day, session in missing:
+                await self._summarize_session(session, day)
         except Exception as e:  # noqa: BLE001
             logger.error(f"[layered_memory] 补生成失败: {e}")
 
