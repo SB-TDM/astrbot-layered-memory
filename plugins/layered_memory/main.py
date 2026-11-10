@@ -130,6 +130,35 @@ def month_key(d: datetime | None = None) -> str:
     return (d or datetime.now()).strftime("%Y-%m")
 
 
+_SHARED_EMBEDDER = None
+
+
+def shared_embedder():
+    """进程内共用的向量模型实例，别的插件也来借这一个。
+
+    Returns:
+        fastembed 的 TextEmbedding；不可用返回 None。
+    """
+    global _SHARED_EMBEDDER
+    if _SHARED_EMBEDDER is not None:
+        return _SHARED_EMBEDDER or None
+    try:
+        os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+        os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
+        from fastembed import TextEmbedding
+
+        EMBED_DIR.mkdir(parents=True, exist_ok=True)
+        _SHARED_EMBEDDER = TextEmbedding(
+            model_name=EMBED_MODEL, cache_dir=str(EMBED_DIR / "models")
+        )
+        logger.info("[向量] 共享模型已加载")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[向量] 模型不可用: {e}")
+        _SHARED_EMBEDDER = False
+    return _SHARED_EMBEDDER or None
+
+
 class LayeredMemory(Star):
     """七层记忆：内核 + 月/周/日纪要 + 近期摘要 + 原文缓存。"""
 
@@ -554,21 +583,7 @@ class LayeredMemory(Star):
         """
         if self._embedder is not None:
             return self._embedder or None
-        try:
-            # 走镜像下载，并关掉 xet 传输（镜像不代理它）
-            os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-            os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-            os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-            from fastembed import TextEmbedding
-
-            EMBED_DIR.mkdir(parents=True, exist_ok=True)
-            self._embedder = TextEmbedding(
-                model_name=EMBED_MODEL, cache_dir=str(EMBED_DIR / "models")
-            )
-            logger.info("[layered_memory] 向量模型已加载")
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"[layered_memory] 向量模型不可用，回退关键词: {e}")
-            self._embedder = False
+        self._embedder = shared_embedder() or False
         return self._embedder or None
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
@@ -743,8 +758,9 @@ class LayeredMemory(Star):
         """
         if not self.history_db.exists():
             return []
-        start = datetime.fromtimestamp(day_start).strftime("%Y-%m-%d %H:%M:%S")
-        end = datetime.fromtimestamp(day_end).strftime("%Y-%m-%d %H:%M:%S")
+        # platform_message_history 存的是 UTC，本地时间要换算后再比
+        start = datetime.utcfromtimestamp(day_start).strftime("%Y-%m-%d %H:%M:%S")
+        end = datetime.utcfromtimestamp(day_end).strftime("%Y-%m-%d %H:%M:%S")
         try:
             con = sqlite3.connect(f"file:{self.history_db}?mode=ro", uri=True)
             rows = con.execute(
@@ -857,7 +873,7 @@ class LayeredMemory(Star):
             ).fetchone()[0]
             con.close()
             if self._is_group(session):
-                since_str = datetime.fromtimestamp(since or 0).strftime("%Y-%m-%d %H:%M:%S")
+                since_str = datetime.utcfromtimestamp(since or 0).strftime("%Y-%m-%d %H:%M:%S")
                 try:
                     hcon = sqlite3.connect(f"file:{self.history_db}?mode=ro", uri=True)
                     n = hcon.execute(

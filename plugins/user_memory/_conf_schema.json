@@ -124,5 +124,113 @@
     "type": "string",
     "default": "",
     "hint": "填你的 QQ 号。群聊纪要里会把你标成「他」，承诺与管理命令也只认这个号。"
+  },
+  "smart_mood": {
+    "description": "按语境推断情绪",
+    "type": "bool",
+    "default": true,
+    "hint": "除了被夸被骂，还会根据消息内容、间隔时间、时段判断她此刻的心情，比如被冷落、深夜犯困、你在倾诉。"
+  },
+  "mood_half_life_min": {
+    "description": "情绪半衰期（分钟）",
+    "type": "int",
+    "default": 12,
+    "hint": "不动它的话，每过这么久强度减半。"
+  },
+  "mood_calm_step": {
+    "description": "被哄一次降多少",
+    "type": "float",
+    "default": 0.25,
+    "hint": "她说话变软一次，当前情绪下降这个值；好感高的人下降更快。"
+  },
+  "mood_fade_threshold": {
+    "description": "低于多少算消退",
+    "type": "float",
+    "default": 0.15,
+    "hint": "强度低于这个值就不再注入情绪。"
+  },
+  "mood_cool_streak": {
+    "description": "连续几句才算冷淡",
+    "type": "int",
+    "default": 4,
+    "hint": "她连续这么多轮都只回很短的干巴句子，才判定为情绪冷淡，避免误伤正常应答。"
+  },
+  "mood_max_channels": {
+    "description": "最多几种情绪并存",
+    "type": "int",
+    "default": 2,
+    "hint": "允许同时存在几种情绪（比如赌气 + 黏人）。设 1 就退回单情绪模式。"
+  },
+  "mood_composite": {
+    "description": "允许复合情绪",
+    "type": "bool",
+    "default": true,
+    "hint": "出现「下不为例」「总行了吧」「（抱住」这类转折标记时，补一条次要情绪当底色。"
+  },
+  "mood_secondary_cap": {
+    "description": "次要情绪强度上限",
+    "type": "float",
+    "default": 0.35,
+    "hint": "次要情绪只做底色，不抢主情绪。调高会让复合更明显。"
+  },
+  "show_group_feed": {
+    "description": "私聊里带上群里刚聊的",
+    "type": "bool",
+    "default": true,
+    "hint": "她私聊收不到群消息，容易以为群里没人说话；开启后私聊会带最近几条群消息。"
+  },
+  "group_feed_count": {
+    "description": "带几条群消息",
+    "type": "int",
+    "default": 5,
+    "hint": "太多会挤占私聊上下文。"
+  },
+  "group_feed_hours": {
+    "description": "群消息多久内才算新鲜（小时）",
+    "type": "int",
+    "default": 3,
+    "hint": "超过这个时间群里没动静，就不注入。"
+  },
+  "mood_group_weight": {
+    "description": "群里的事情影响主情绪的权重",
+    "type": "float",
+    "default": 0.3,
+    "hint": "情绪按人统一；群里发生的事按这个比例渗进主情绪。0 就是群里完全不影响，1 就是和私聊一样重。"
+  },
+  "mood_embed_fallback": {
+    "description": "规则不中时用向量判断情绪",
+    "type": "bool",
+    "default": true,
+    "hint": "本地向量模型，零 token。只在高置信度时才认，拿不准就不动。"
+  },
+  "mood_embed_threshold": {
+    "description": "向量判定阈值",
+    "type": "float",
+    "default": 0.62,
+    "hint": "相似度低于这个值就认为拿不准。"
+  },
+  "mood_embed_margin": {
+    "description": "领先第二名的幅度",
+    "type": "float",
+    "default": 0.04,
+    "hint": "第一名要明显高于第二名才认，避免模棱两可。"
+  },
+  "publish_facts_in_group": {
+    "description": "群里放开可公开的事实",
+    "type": "bool",
+    "default": true,
+    "hint": "身份、技术栈、爱好、群友关系这些可以聊；作息、饮食、私事、承诺仍然屏蔽。"
+  },
+  "owner_address": {
+    "description": "对他统一的称呼",
+    "type": "string",
+    "default": "哥",
+    "hint": "私聊和群里都用这个叫法。留空就让她自己决定。"
+  },
+  "group_facts_max": {
+    "description": "群里最多注入几条事实",
+    "type": "int",
+    "default": 12,
+    "hint": "太大会挤占群聊上下文，12 条基本覆盖身份、爱好、群友和情感。"
   }
 }
